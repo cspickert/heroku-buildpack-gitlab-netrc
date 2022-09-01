@@ -1,0 +1,93 @@
+#!/usr/bin/env python
+
+import os
+import sys
+from pathlib import Path
+
+project_root = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, project_root)
+
+from gitlab import gitlab_user_login, user_block, valid_login  # noqa
+
+NETRC_TEMPLATE = (
+    "machine gitlab.com login {gitlab_token_username} password {gitlab_token_password}"
+)
+
+
+def main(args):
+    token_file_path = args.env_dir / "GITLAB_AUTH_TOKEN"
+    if token_file_path.exists():
+        with open(token_file_path) as token_file:
+            gitlab_token_password = token_file.read().strip()
+    else:
+        gitlab_token_password = None
+
+    if not gitlab_token_password:
+        print("       !!!! GITLAB_AUTH_TOKEN not set")
+        print("       !!!!   Try `heroku config:add GITLAB_AUTH_TOKEN=<my token>`")
+        return 1
+
+    gitlab_token_username = gitlab_user_login(gitlab_token_password)
+    if not gitlab_token_username:
+        print("       !!!! GITLAB_AUTH_TOKEN is not valid")
+        return 1
+
+    ##
+    # Supply `curl` on the BUILD machine (not in slug) with token to access
+    # private gitlab repos
+    netrc_fd = os.open(
+        Path.home() / ".netrc", flags=os.O_CREAT | os.O_WRONLY, mode=0o600
+    )
+    with open(netrc_fd, "w+") as netrc_file:
+        netrc_file.write(
+            NETRC_TEMPLATE.format(
+                gitlab_token_username=gitlab_token_username,
+                gitlab_token_password=gitlab_token_password,
+            )
+        )
+
+    ##
+    # Tell `curl` on the BUILD machine (not in slug) to use ~/.netrc
+    curlrc_fd = os.open(
+        Path.home() / ".curlrc", flags=os.O_CREAT | os.O_WRONLY, mode=0o600
+    )
+    with open(curlrc_fd, "w+") as curlrc_file:
+        curlrc_file.write("--netrc-optional")
+
+    if valid_login(gitlab_token_password):
+        print("       Generated .netrc & .curlrc files (available only at build-time)")
+    else:
+        print(
+            f"       !!!! No valid gitlab user found with GITLAB_AUTH_TOKEN: '{gitlab_token_password}'"
+        )
+        return 1
+
+    ##
+    # Remove $GITLAB_AUTH_TOKEN from runtime environment at slug boot time.
+    profile_d = args.build_dir / ".profile.d"
+    profile_d.mkdir(parents=True, exist_ok=True)
+    netrc_sh_fd = os.open(
+        profile_d / "netrc.sh", flags=os.O_CREAT | os.O_WRONLY, mode=0o600
+    )
+    with open(netrc_sh_fd, "w+") as netrc_sh_file:
+        netrc_sh_file.write("unset GITLAB_AUTH_TOKEN")
+
+    ##
+    # Print out user information
+    print(user_block(gitlab_token_password))
+
+    return 0
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    import sys
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("build_dir", type=Path)
+    parser.add_argument("cache_dir", type=Path)
+    parser.add_argument("env_dir", type=Path)
+
+    args = parser.parse_args()
+    sys.exit(main(args))
